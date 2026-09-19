@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: shell
+  namespace: mfe
+spec:
+  selector:
+    app: shell
+  ports:
+    - port: 80
+      targetPort: 80
