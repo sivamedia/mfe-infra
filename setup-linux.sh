@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# MFE Infrastructure Setup - Ubuntu 26.04
-# Run from mfe-infra:
-#   ./setup-linux.sh
-# ============================================================
-
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$INFRA_ROOT/.." && pwd)"
+PROJECT_ROOT="$INFRA_ROOT"
 K8S_ROOT="$INFRA_ROOT/k8s"
 
 APPS=("orders" "products" "shell" "users")
@@ -17,10 +11,13 @@ INGRESS_MANIFEST="https://raw.githubusercontent.com/kubernetes/ingress-nginx/con
 
 log() {
     echo
-    echo "=== $1 ==="
+    echo "============================================================"
+    echo "=== $1"
+    echo "============================================================"
 }
 
 fail() {
+    echo
     echo "ERROR: $1" >&2
     exit 1
 }
@@ -54,7 +51,6 @@ wait_for_kubernetes() {
         echo "Waiting for Kubernetes... ($i/60)"
         sleep 2
     done
-
     rm -f /tmp/mfe_nodes
     fail "Kubernetes did not become Ready within 2 minutes."
 }
@@ -71,78 +67,58 @@ add_hosts() {
         "users.mfe.local"
     )
 
+    local ingress_ip
+
+    ingress_ip="$(
+        kubectl get svc ingress-nginx-controller \
+            -n ingress-nginx \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+            2>/dev/null || true
+    )"
+
+    if [[ -z "$ingress_ip" ]]; then
+        ingress_ip="$(minikube ip)"
+        echo "LoadBalancer IP unavailable. Using Minikube IP: $ingress_ip"
+    else
+        echo "Using Ingress LoadBalancer IP: $ingress_ip"
+    fi
+
     for host in "${hosts[@]}"; do
-        if grep -Eq "^[[:space:]]*127\.0\.0\.1[[:space:]]+$host([[:space:]]|$)" "$hosts_file"; then
-            echo "Already present: 127.0.0.1 $host"
-        else
-            echo "Adding: 127.0.0.1 $host"
-            echo "127.0.0.1 $host" | sudo tee -a "$hosts_file" >/dev/null
-        fi
+
+        # Remove existing entries for this hostname.
+        sudo sed -i "/[[:space:]]${host}[[:space:]]*$/d" "$hosts_file"
+
+        # Add the current Ingress IP.
+        echo "$ingress_ip $host" |
+            sudo tee -a "$hosts_file" >/dev/null
+
+        echo "Configured: $ingress_ip $host"
     done
 }
 
-# ------------------------------------------------------------
-# Prerequisites
-# ------------------------------------------------------------
-
 log "Checking prerequisites"
-
 require_cmd docker
 require_cmd kubectl
+require_cmd minikube
+require_cmd sudo
 
-# ------------------------------------------------------------
-# Platform-specific Docker startup
-# ------------------------------------------------------------
+echo "Docker:   $(docker --version)"
+echo "kubectl:  $(kubectl version --client 2>/dev/null | head -n 1)"
+echo "Minikube: $(minikube version --short 2>/dev/null || true)"
 
-PLATFORM="linux"
+log "Checking Docker"
+wait_for_docker
 
-if [[ "$PLATFORM" == "linux" ]]; then
-
-    log "Starting Docker Engine"
-
-    if ! docker info >/dev/null 2>&1; then
-        echo "Docker Engine is not running. Starting docker.service..."
-        sudo systemctl start docker
-    fi
-
-    wait_for_docker
-
+log "Checking Minikube"
+if ! minikube status >/dev/null 2>&1; then
+    echo "Starting Minikube..."
+    minikube start --driver=docker
 else
-    fail "This script is for Ubuntu/Linux only."
+    echo "Minikube is already running."
 fi
-
-# ------------------------------------------------------------
-# Kubernetes
-# ------------------------------------------------------------
 
 log "Checking Kubernetes"
-
-CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
-
-if [[ -z "$CURRENT_CONTEXT" ]]; then
-    fail "No kubectl context is configured."
-fi
-
-echo "Current Kubernetes context: $CURRENT_CONTEXT"
-
-if kubectl get nodes --no-headers >/tmp/mfe_nodes 2>/dev/null; then
-    if grep -Eq '[[:space:]]Ready([[:space:]]|$)' /tmp/mfe_nodes; then
-        echo "Kubernetes is already ready."
-        kubectl get nodes
-    else
-        rm -f /tmp/mfe_nodes
-        wait_for_kubernetes
-    fi
-else
-    rm -f /tmp/mfe_nodes
-    wait_for_kubernetes
-fi
-
-rm -f /tmp/mfe_nodes
-
-# ------------------------------------------------------------
-# Build Docker images
-# ------------------------------------------------------------
+wait_for_kubernetes
 
 log "Building MFE Docker images"
 
@@ -153,12 +129,7 @@ declare -a IMAGE_NAMES=(
     "mfe-orders:1.0"
 )
 
-declare -a APP_NAMES=(
-    "shell"
-    "users"
-    "products"
-    "orders"
-)
+declare -a APP_NAMES=("shell" "users" "products" "orders")
 
 for index in "${!APP_NAMES[@]}"; do
     app="${APP_NAMES[$index]}"
@@ -173,22 +144,21 @@ for index in "${!APP_NAMES[@]}"; do
     echo
     echo "Building $image..."
     docker build -f "$dockerfile" -t "$image" "$context"
+
+    echo "Loading $image into Minikube..."
+    minikube image load "$image"
 done
 
-# ------------------------------------------------------------
-# Namespace
-# ------------------------------------------------------------
+log "Verifying MFE images in Minikube"
+for image in "${IMAGE_NAMES[@]}"; do
+    minikube image ls | grep -Fq "docker.io/library/$image" ||         fail "MFE image was not found inside Minikube: $image"
+    echo "Found: docker.io/library/$image"
+done
 
 log "Creating MFE namespace"
-
 kubectl apply -f "$K8S_ROOT/namespace.yaml"
 
-# ------------------------------------------------------------
-# ingress-nginx
-# ------------------------------------------------------------
-
 log "Checking ingress-nginx"
-
 if ! kubectl get ingressclass nginx >/dev/null 2>&1; then
     echo "NGINX Ingress controller is not installed. Installing..."
     kubectl apply -f "$INGRESS_MANIFEST"
@@ -196,87 +166,71 @@ else
     echo "NGINX Ingress controller is already installed."
 fi
 
-echo "Waiting for ingress-nginx controller..."
+log "Waiting for ingress-nginx controller"
+kubectl rollout status deployment/ingress-nginx-controller     -n ingress-nginx     --timeout=180s
 
-kubectl rollout status \
-    deployment/ingress-nginx-controller \
-    -n ingress-nginx \
-    --timeout=180s
+log "Waiting for ingress admission webhook"
+admission_ip=""
+for i in {1..30}; do
+    admission_ip="$(
+        kubectl get endpointslice             -n ingress-nginx             -l kubernetes.io/service-name=ingress-nginx-controller-admission             -o jsonpath='{.items[0].endpoints[0].addresses[0]}'             2>/dev/null || true
+    )"
 
-# ------------------------------------------------------------
-# Deployments
-# ------------------------------------------------------------
+    if [[ -n "$admission_ip" ]]; then
+        echo "Ingress admission webhook is ready: $admission_ip"
+        break
+    fi
+
+    echo "Waiting for admission webhook... ($i/30)"
+    sleep 2
+
+    [[ "$i" -lt 30 ]] || fail "Ingress admission webhook did not become ready."
+done
 
 log "Applying MFE deployments"
-
 for app in "${APPS[@]}"; do
     file="$K8S_ROOT/$app/deployment.yaml"
     [[ -f "$file" ]] || fail "Deployment manifest not found: $file"
-
     kubectl apply -f "$file"
 done
 
-# ------------------------------------------------------------
-# Services
-# ------------------------------------------------------------
-
 log "Applying MFE services"
-
 for app in "${APPS[@]}"; do
     file="$K8S_ROOT/$app/service.yaml"
     [[ -f "$file" ]] || fail "Service manifest not found: $file"
-
     kubectl apply -f "$file"
 done
 
-# ------------------------------------------------------------
-# Ingress
-# ------------------------------------------------------------
-
 log "Applying MFE ingress"
-
 kubectl apply -f "$K8S_ROOT/ingress.yaml"
 
-# ------------------------------------------------------------
-# Wait for applications
-# ------------------------------------------------------------
-
 log "Waiting for MFE deployments"
-
 for app in "${APPS[@]}"; do
-    kubectl rollout status \
-        "deployment/$app" \
-        -n mfe \
-        --timeout=120s
+    kubectl rollout status "deployment/$app" -n mfe --timeout=120s
 done
 
-# ------------------------------------------------------------
-# Hosts
-# ------------------------------------------------------------
-
 add_hosts
-
-# ------------------------------------------------------------
-# Final status
-# ------------------------------------------------------------
 
 log "MFE setup complete"
 
 echo
+echo "=== Kubernetes Nodes ==="
+kubectl get nodes
+echo
 echo "=== MFE Pods ==="
 kubectl get pods -n mfe
-
 echo
 echo "=== MFE Services ==="
 kubectl get svc -n mfe
-
 echo
 echo "=== MFE Ingress ==="
 kubectl get ingress -n mfe
-
 echo
 echo "=== Ingress Controller ==="
 kubectl get pods -n ingress-nginx
+echo
+echo "=== Ingress Service ==="
+kubectl get svc -n ingress-nginx
 
 cat <<'EOF'
 
@@ -284,31 +238,19 @@ cat <<'EOF'
 MFE URLs
 ============================================================
 
-Shell:
-  http://mfe.local
-
-Products:
-  http://products.mfe.local
-
-Orders:
-  http://orders.mfe.local
-
-Users:
-  http://users.mfe.local
-
-Module Federation manifests:
-  http://products.mfe.local/mf-manifest.json
-  http://orders.mfe.local/mf-manifest.json
-  http://users.mfe.local/mf-manifest.json
+http://mfe.local
+http://products.mfe.local
+http://orders.mfe.local
+http://users.mfe.local
 
 ============================================================
-Useful commands
+IMPORTANT
 ============================================================
 
-kubectl get pods -n mfe
-kubectl get svc -n mfe
-kubectl get ingress -n mfe
-kubectl get pods -n ingress-nginx
+For clean LoadBalancer URLs, keep this running
+in another terminal:
+
+    minikube tunnel
 
 ============================================================
 EOF
