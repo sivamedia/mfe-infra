@@ -1,0 +1,25 @@
+apiVersion: superset.apache.org/v1alpha1
+kind: Superset
+metadata:
+  name: superset
+  namespace: superset
+spec:
+  image:
+    repository: superset-custom
+    tag: "6.1.0-pg"
+
+  secretKeyFrom:
+    name: superset-secret-key
+    key: secret-key
+
+  metastore:
+    type: PostgreSQL
+    uriFrom:
+      name: superset-metastore
+      key: connection-string
+
+  webServer:
+    replicas: 1
+    service:
+      type: ClusterIP
+      port: 8088

@@ -1,0 +1,5 @@
+FROM apache/superset:6.1.0
+
+USER root
+RUN /usr/local/bin/python -m pip install --no-cache-dir psycopg2-binary
+USER superset
