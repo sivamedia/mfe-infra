@@ -1,27 +1,25 @@
-# MFE Infrastructure Setup
-# Run from Administrator PowerShell:
-#   powershell -ExecutionPolicy Bypass -File .\setup.ps1
+#requires -Version 5.1
+
+# ============================================================
+# MFE Infrastructure Setup - Windows
+#
+# Run from mfe-infra in Administrator PowerShell:
+#   Set-ExecutionPolicy -Scope Process Bypass
+#   .\setup-win.ps1
 #
 # Expected repo layout:
 # mfe-infra\
-#   setup.ps1
+#   setup-win.ps1
+#   setup-macos.sh
+#   setup-linux.sh
 #   k8s\
-#     namespace.yaml
-#     ingress.yaml
-#     orders\deployment.yaml
-#     orders\service.yaml
-#     products\deployment.yaml
-#     products\service.yaml
-#     shell\deployment.yaml
-#     shell\service.yaml
-#     users\deployment.yaml
-#     users\service.yaml
+# ============================================================
 
 $ErrorActionPreference = "Stop"
 
-$InfraRoot = $PSScriptRoot
+$InfraRoot   = $PSScriptRoot
 $ProjectRoot = Split-Path -Parent $InfraRoot
-$K8sRoot = Join-Path $InfraRoot "k8s"
+$K8sRoot     = Join-Path $InfraRoot "k8s"
 
 $Apps = @("orders", "products", "shell", "users")
 
@@ -47,20 +45,65 @@ function Step($Message) {
 
 function Require-Command($Command) {
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
-        throw "$Command was not found."
+        throw "$Command was not found. Install it first."
     }
 }
 
-function Run-Checked($Description, $Command) {
-    Write-Host $Description -ForegroundColor Yellow
-    & $Command
-    if ($LASTEXITCODE -ne 0) {
-        throw "Command failed: $Description"
+function Wait-Docker {
+    for ($i = 1; $i -le 60; $i++) {
+        docker info *> $null
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Docker Engine is ready." -ForegroundColor Green
+            return
+        }
+
+        Write-Host "Waiting for Docker Engine... ($i/60)" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 2
     }
+
+    throw "Docker Engine did not become ready within 2 minutes."
+}
+
+function Wait-Kubernetes {
+    for ($i = 1; $i -le 60; $i++) {
+        $nodes = kubectl get nodes --no-headers 2>$null
+
+        if ($LASTEXITCODE -eq 0 -and $nodes) {
+            $ready = kubectl get nodes --no-headers 2>$null |
+                Select-String "\sReady\s"
+
+            if ($ready) {
+                Write-Host "Kubernetes is ready." -ForegroundColor Green
+                kubectl get nodes
+                return
+            }
+        }
+
+        Write-Host "Waiting for Kubernetes... ($i/60)" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Kubernetes did not become Ready within 2 minutes."
 }
 
 # ------------------------------------------------------------
-# 1. Prerequisites
+# Administrator check
+# ------------------------------------------------------------
+
+Step "Checking Administrator privileges"
+
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+
+if (-not $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    throw "Run this script from Administrator PowerShell."
+}
+
+# ------------------------------------------------------------
+# Prerequisites
 # ------------------------------------------------------------
 
 Step "Checking prerequisites"
@@ -69,133 +112,70 @@ Require-Command "docker"
 Require-Command "kubectl"
 
 # ------------------------------------------------------------
-# 2. Start Docker Desktop if necessary
+# Start Docker Desktop
 # ------------------------------------------------------------
 
-Write-Host "Checking Docker Desktop..." -ForegroundColor Yellow
+Step "Starting Docker Desktop"
+
+$DockerDesktopExe = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+
+if (-not (Test-Path $DockerDesktopExe)) {
+    $DockerDesktopExe = Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\Docker Desktop.exe"
+}
+
+if (-not (Test-Path $DockerDesktopExe)) {
+    throw "Docker Desktop executable was not found."
+}
 
 $DockerDesktopProcess = Get-Process "Docker Desktop" -ErrorAction SilentlyContinue
 
 if (-not $DockerDesktopProcess) {
     Write-Host "Docker Desktop is not running. Starting it..." -ForegroundColor Yellow
-
-    $DockerDesktopExe = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
-
-    if (Test-Path $DockerDesktopExe) {
-        Start-Process -FilePath $DockerDesktopExe
-    }
-    else {
-        $DockerDesktopExe = Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\Docker Desktop.exe"
-
-        if (Test-Path $DockerDesktopExe) {
-            Start-Process -FilePath $DockerDesktopExe
-        }
-        else {
-            throw "Docker Desktop executable was not found."
-        }
-    }
+    Start-Process -FilePath $DockerDesktopExe
 }
 
-# ------------------------------------------------------------
-# 3. Wait for Docker Engine
-# ------------------------------------------------------------
-
-$DockerReady = $false
-
-for ($i = 1; $i -le 60; $i++) {
-    docker info *> $null
-
-    if ($LASTEXITCODE -eq 0) {
-        $DockerReady = $true
-        break
-    }
-
-    Write-Host "Waiting for Docker Engine... ($i/60)" -ForegroundColor DarkGray
-    Start-Sleep -Seconds 2
-}
-
-if (-not $DockerReady) {
-    throw "Docker Engine did not become ready within 2 minutes."
-}
-
-Write-Host "Docker Engine is ready." -ForegroundColor Green
+Wait-Docker
 
 # ------------------------------------------------------------
-# 4. Ensure docker-desktop Kubernetes context
+# Kubernetes
 # ------------------------------------------------------------
 
 Step "Checking Kubernetes"
 
 $Context = kubectl config current-context 2>$null
 
-if ($Context -ne "docker-desktop") {
-    Write-Host "Current context: $Context" -ForegroundColor Yellow
-    Write-Host "Switching to docker-desktop..." -ForegroundColor Yellow
-
-    kubectl config use-context docker-desktop
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Kubernetes context 'docker-desktop' is not available."
-    }
+if (-not $Context) {
+    throw "No kubectl context is configured."
 }
 
-# ------------------------------------------------------------
-# 5. Check Kubernetes immediately first
-#    Do NOT wait if it is already ready.
-# ------------------------------------------------------------
+Write-Host "Current Kubernetes context: $Context" -ForegroundColor Green
 
-$KubernetesReady = $false
+$Nodes = kubectl get nodes --no-headers 2>$null
 
-$NodeStatus = kubectl get nodes --no-headers 2>$null
-
-if ($LASTEXITCODE -eq 0 -and $NodeStatus) {
+if ($LASTEXITCODE -eq 0 -and $Nodes) {
     $ReadyNodes = kubectl get nodes --no-headers 2>$null |
         Select-String "\sReady\s"
 
     if ($ReadyNodes) {
-        $KubernetesReady = $true
         Write-Host "Kubernetes is already ready." -ForegroundColor Green
+        kubectl get nodes
+    }
+    else {
+        Wait-Kubernetes
     }
 }
-
-# ------------------------------------------------------------
-# 6. Wait only when Kubernetes is actually unavailable
-# ------------------------------------------------------------
-
-if (-not $KubernetesReady) {
-    Write-Host "Kubernetes is not ready. Waiting for Docker Desktop Kubernetes..." -ForegroundColor Yellow
-
-    for ($i = 1; $i -le 60; $i++) {
-        $NodeStatus = kubectl get nodes --no-headers 2>$null
-
-        if ($LASTEXITCODE -eq 0 -and $NodeStatus) {
-            $ReadyNodes = kubectl get nodes --no-headers 2>$null |
-                Select-String "\sReady\s"
-
-            if ($ReadyNodes) {
-                $KubernetesReady = $true
-                break
-            }
-        }
-
-        Write-Host "Waiting for Kubernetes... ($i/60)" -ForegroundColor DarkGray
-        Start-Sleep -Seconds 2
-    }
+else {
+    Wait-Kubernetes
 }
 
-if (-not $KubernetesReady) {
-    throw "Docker Desktop Kubernetes did not become Ready within 2 minutes. Check Docker Desktop > Settings > Kubernetes."
-}
-
-kubectl get nodes
-
 # ------------------------------------------------------------
-# 7. Build MFE Docker images
+# Build Docker images
 # ------------------------------------------------------------
 
 Step "Building MFE Docker images"
 
 foreach ($Image in $Images) {
+
     $DockerFile = Join-Path $ProjectRoot $Image.DockerFile
     $BuildContext = Join-Path $ProjectRoot $Image.Context
 
@@ -209,7 +189,10 @@ foreach ($Image in $Images) {
 
     Write-Host "`nBuilding $($Image.Name)..." -ForegroundColor Yellow
 
-    docker build -f $DockerFile -t $Image.Name $BuildContext
+    docker build `
+        -f $DockerFile `
+        -t $Image.Name `
+        $BuildContext
 
     if ($LASTEXITCODE -ne 0) {
         throw "Docker build failed for $($Image.Name)."
@@ -217,7 +200,7 @@ foreach ($Image in $Images) {
 }
 
 # ------------------------------------------------------------
-# 8. Create namespace
+# Namespace
 # ------------------------------------------------------------
 
 Step "Creating MFE namespace"
@@ -225,11 +208,11 @@ Step "Creating MFE namespace"
 kubectl apply -f (Join-Path $K8sRoot "namespace.yaml")
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to create/apply the mfe namespace."
+    throw "Failed to apply the mfe namespace."
 }
 
 # ------------------------------------------------------------
-# 9. Install ingress-nginx only if missing
+# ingress-nginx
 # ------------------------------------------------------------
 
 Step "Checking ingress-nginx"
@@ -237,6 +220,7 @@ Step "Checking ingress-nginx"
 $IngressClass = kubectl get ingressclass nginx --ignore-not-found 2>$null
 
 if (-not $IngressClass) {
+
     Write-Host "NGINX Ingress controller is not installed. Installing..." -ForegroundColor Yellow
 
     kubectl apply -f $IngressManifest
@@ -251,7 +235,8 @@ else {
 
 Write-Host "Waiting for ingress-nginx controller..." -ForegroundColor Yellow
 
-kubectl rollout status deployment/ingress-nginx-controller `
+kubectl rollout status `
+    deployment/ingress-nginx-controller `
     -n ingress-nginx `
     --timeout=180s
 
@@ -260,12 +245,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ------------------------------------------------------------
-# 10. Apply deployments
+# Deployments
 # ------------------------------------------------------------
 
 Step "Applying MFE deployments"
 
 foreach ($App in $Apps) {
+
     $Deployment = Join-Path $K8sRoot "$App\deployment.yaml"
 
     if (-not (Test-Path $Deployment)) {
@@ -280,12 +266,13 @@ foreach ($App in $Apps) {
 }
 
 # ------------------------------------------------------------
-# 11. Apply services
+# Services
 # ------------------------------------------------------------
 
 Step "Applying MFE services"
 
 foreach ($App in $Apps) {
+
     $Service = Join-Path $K8sRoot "$App\service.yaml"
 
     if (-not (Test-Path $Service)) {
@@ -300,7 +287,7 @@ foreach ($App in $Apps) {
 }
 
 # ------------------------------------------------------------
-# 12. Apply ingress
+# Ingress
 # ------------------------------------------------------------
 
 Step "Applying MFE ingress"
@@ -318,13 +305,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ------------------------------------------------------------
-# 13. Wait for application deployments
+# Wait for deployments
 # ------------------------------------------------------------
 
 Step "Waiting for MFE deployments"
 
 foreach ($App in $Apps) {
-    kubectl rollout status deployment/$App -n mfe --timeout=120s
+
+    kubectl rollout status `
+        "deployment/$App" `
+        -n mfe `
+        --timeout=120s
 
     if ($LASTEXITCODE -ne 0) {
         throw "$App deployment did not become ready."
@@ -332,21 +323,21 @@ foreach ($App in $Apps) {
 }
 
 # ------------------------------------------------------------
-# 14. Configure Windows hosts
+# Windows hosts file
 # ------------------------------------------------------------
 
 Step "Configuring Windows hosts file"
 
 $HostsFile = "$env:SystemRoot\System32\drivers\etc\hosts"
 
-try {
-    $HostsContent = @(Get-Content $HostsFile -ErrorAction Stop)
-}
-catch {
-    throw "Cannot read $HostsFile. Run this script from Administrator PowerShell."
+if (-not (Test-Path $HostsFile)) {
+    throw "Hosts file not found: $HostsFile"
 }
 
+$HostsContent = @(Get-Content $HostsFile)
+
 foreach ($HostName in $Hosts) {
+
     $Entry = "127.0.0.1 $HostName"
 
     $Existing = $HostsContent | Where-Object {
@@ -354,8 +345,11 @@ foreach ($HostName in $Hosts) {
     }
 
     if (-not $Existing) {
+
         Add-Content -Path $HostsFile -Value $Entry
+
         $HostsContent += $Entry
+
         Write-Host "Added: $Entry" -ForegroundColor Green
     }
     else {
@@ -364,7 +358,7 @@ foreach ($HostName in $Hosts) {
 }
 
 # ------------------------------------------------------------
-# 15. Final status
+# Final status
 # ------------------------------------------------------------
 
 Step "MFE setup complete"
